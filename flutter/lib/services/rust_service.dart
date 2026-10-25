@@ -22,6 +22,10 @@ typedef RustStartCall = Future<rust.ActionResult> Function({
 });
 
 class RustService extends AppService {
+  /// 原生侧这些参数按 i32 编码，编码层对越界值静默回绕，因此送出前按 i32 范围拦住
+  static const int _i32Min = -2147483648;
+  static const int _i32Max = 2147483647;
+
   StatusData? _status;
   ConfigData? _config;
   bool _initialized = false;
@@ -164,6 +168,26 @@ class RustService extends AppService {
   }) async {
     // 每次动作先清空上一次的原因，避免把旧错误当成本次结果展示
     _error = null;
+
+    final outOfRange = _outOfI32Range({
+      'ips': ips,
+      'threads': threads,
+      'tlsPort': tlsPort,
+      'httpPort': httpPort,
+      'maxStickySlots': maxStickySlots,
+    });
+    if (outOfRange != null) {
+      _error = '$outOfRange 超出 32 位整数范围';
+      debugPrint('启动服务失败: $_error');
+      return false;
+    }
+    // 延迟上限按 u64 编码，负数会被编码层按模 2^64 回绕成极大值
+    if (delayLimit != null && delayLimit < 0) {
+      _error = '延迟上限不能为负数';
+      debugPrint('启动服务失败: $_error');
+      return false;
+    }
+
     try {
       final result = await _startCall(
         ipFile: ipFile,
@@ -191,6 +215,17 @@ class RustService extends AppService {
       debugPrint('启动服务失败: $e');
       return false;
     }
+  }
+
+  /// 返回第一个超出 i32 范围的字段名，全部在范围内时返回 null
+  static String? _outOfI32Range(Map<String, int?> values) {
+    for (final entry in values.entries) {
+      final value = entry.value;
+      if (value != null && (value < _i32Min || value > _i32Max)) {
+        return entry.key;
+      }
+    }
+    return null;
   }
 
   @override

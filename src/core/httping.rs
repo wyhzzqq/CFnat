@@ -53,7 +53,6 @@ async fn single_ping(
 pub(crate) struct PingConfig {
     pub tls_port: u16,
     pub http_port: u16,
-    pub client: Arc<crate::core::hyper::MyHyperClient>,
     pub host: Arc<str>,
     pub scheme: Arc<str>,
     pub path: Arc<str>,
@@ -71,6 +70,7 @@ pub(crate) struct PingResultDetail {
 
 pub(crate) async fn http_ping_multi(
     ip: std::net::IpAddr,
+    client: &crate::core::hyper::MyHyperClient,
     config: &PingConfig,
 ) -> Option<PingResultDetail> {
     let limiter = get_global_limiter()?;
@@ -91,7 +91,7 @@ pub(crate) async fn http_ping_multi(
             break;
         }
 
-        if let Some((delay, c)) = single_ping(&config.client, &config.host, &uri, config.timeout_ms).await {
+        if let Some((delay, c)) = single_ping(client, &config.host, &uri, config.timeout_ms).await {
             total_delay += delay;
             success_count += 1;
 
@@ -135,7 +135,6 @@ pub(crate) struct HttpingConfig {
     pub timeout_ms: u64,
     pub delay_limit: u64,
     pub colo_filter: Option<Arc<Vec<String>>>,
-    pub client: Arc<crate::core::hyper::MyHyperClient>,
 }
 
 pub(crate) async fn run_continuous_httping(
@@ -154,7 +153,6 @@ pub(crate) async fn run_continuous_httping(
     let ping_config = PingConfig {
         tls_port: config.tls_port,
         http_port: config.http_port,
-        client: config.client,
         host: Arc::from(host.as_str()),
         scheme: Arc::from(scheme),
         path: Arc::from(path.as_str()),
@@ -167,9 +165,9 @@ pub(crate) async fn run_continuous_httping(
     let concurrency = get_global_limiter().unwrap().max_concurrent();
     let mut tasks: JoinSet<PingResult> = JoinSet::new();
 
-    let spawn_task = |ip: std::net::IpAddr, cfg: PingConfig| {
+    let spawn_task = |ip: std::net::IpAddr, client: Arc<crate::core::hyper::MyHyperClient>, cfg: PingConfig| {
         async move { 
-            http_ping_multi(ip, &cfg).await.map(|r| (r.addr, r.delay, r.colo, r.colo_mismatch))
+            http_ping_multi(ip, &client, &cfg).await.map(|r| (r.addr, r.delay, r.colo, r.colo_mismatch))
         }
     };
 
@@ -211,6 +209,12 @@ pub(crate) async fn run_continuous_httping(
             }
         }
 
+        // 每轮取当前客户端，时间跳跃后的重建从本轮测速起生效
+        let Some(client) = lb.current_client() else {
+            push_log("ERROR", "HTTP 客户端未初始化，测速中止");
+            break;
+        };
+
         // IP 池无限回收，必须给扫描设界：连续一整轮都命中已收录 IP 即停止本轮，
         // 否则小文件场景下会退化为无 await 的同步空转
         let sweep_limit = ip_pool.total_count() as usize;
@@ -229,7 +233,7 @@ pub(crate) async fn run_continuous_httping(
             }
 
             consecutive_hits = 0;
-            tasks.spawn(spawn_task(ip, ping_config.clone()));
+            tasks.spawn(spawn_task(ip, client.clone(), ping_config.clone()));
         }
 
         // 无在飞探测且本轮无新 IP：挂起等池变化（节点移除会触发 notify），

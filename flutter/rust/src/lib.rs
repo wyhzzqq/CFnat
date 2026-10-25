@@ -1,8 +1,10 @@
 mod frb_generated; /* AUTO INJECTED BY flutter_rust_bridge. This line may not be accurate, and you can change it according to your needs. */
 use flutter_rust_bridge::frb;
+use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::sync::Arc;
-use cfnat::core::ServiceState;
+use cfnat::core::{ServiceError, ServiceState};
+use cfnat::core::ErrorCategory as CoreErrorCategory;
 use cfnat::core::types::ConfigOverrides;
 use tokio::runtime::Runtime;
 
@@ -119,6 +121,22 @@ impl ActionResult {
     }
 }
 
+/// 把 i32 参数转换为目标类型，目标类型无法表示该值时返回校验错误；
+/// 接受范围与 HTTP 入口按 Option<usize> / Option<u16> 反序列化一致
+fn checked<T>(name: &str, value: Option<i32>) -> Result<Option<T>, ServiceError>
+where
+    T: TryFrom<i32>,
+{
+    value
+        .map(|v| {
+            T::try_from(v).map_err(|_| ServiceError {
+                category: CoreErrorCategory::Validation,
+                message: format!("{} 超出允许范围: {}", name, v),
+            })
+        })
+        .transpose()
+}
+
 fn build_overrides(
     ip_file: Option<String>,
     ip_content: Option<Vec<String>>,
@@ -132,21 +150,29 @@ fn build_overrides(
     max_sticky_slots: Option<i32>,
     addr: Option<String>,
     colo: Option<Vec<String>>,
-) -> ConfigOverrides {
-    ConfigOverrides {
+) -> Result<ConfigOverrides, ServiceError> {
+    let addr = match addr {
+        Some(text) => Some(text.parse::<SocketAddr>().map_err(|_| ServiceError {
+            category: CoreErrorCategory::Validation,
+            message: format!("监听地址无效: {}", text),
+        })?),
+        None => None,
+    };
+
+    Ok(ConfigOverrides {
         ip_file,
         ip_content,
         http,
         delay_limit,
         tlr,
-        ips: ips.map(|v| v as usize),
-        threads: threads.map(|v| v as usize),
-        tls_port: tls_port.map(|v| v as u16),
-        http_port: http_port.map(|v| v as u16),
+        ips: checked("ips", ips)?,
+        threads: checked("threads", threads)?,
+        tls_port: checked("tls_port", tls_port)?,
+        http_port: checked("http_port", http_port)?,
         colo,
-        addr: addr.and_then(|v| v.parse().ok()),
-        max_sticky_slots: max_sticky_slots.map(|v| v as usize),
-    }
+        addr,
+        max_sticky_slots: checked("max_sticky_slots", max_sticky_slots)?,
+    })
 }
 
 #[frb]
@@ -170,11 +196,14 @@ pub fn start_service(
     let service = get_service();
     let mut config = service.get_config();
 
-    let overrides = build_overrides(
+    let overrides = match build_overrides(
         ip_file, ip_content, http, delay_limit, tlr,
         ips, threads, tls_port, http_port,
         max_sticky_slots, addr, colo,
-    );
+    ) {
+        Ok(overrides) => overrides,
+        Err(e) => return ActionResult::from_error(e),
+    };
     config.apply_overrides(&overrides);
 
     service.update_config(config);

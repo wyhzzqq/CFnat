@@ -351,10 +351,14 @@ impl ServiceState {
             all_ips.extend(content.iter().cloned());
         }
 
-        if all_ips.is_empty() {
-            // 显式传入的文件未能提供任何 IP 时回退到配置文件，必须让调用方从日志识别实际来源
+        let ip_pool = Arc::new(IpPool::new(&all_ips));
+        if ip_pool.total_count() == 0 {
+            // 显式来源由调用方选定，产不出 IP 时报错并指明来源；两者都未指定时使用配置中的路径
             if let Some(file) = ip_file.filter(|f| !f.is_empty()) {
-                push_log("WARN", &format!("IP 文件 {} 未提供有效 IP，回退使用 {}", file, config.ip_file));
+                return Err(ServiceError::validation(format!("IP 文件 {} 未提供有效 IP", file)));
+            }
+            if ip_content.is_some_and(|c| !c.is_empty()) {
+                return Err(ServiceError::validation("填入的 IP 中没有有效条目"));
             }
             let ip_pool = Arc::new(IpPool::from_file(&config.ip_file));
             if ip_pool.total_count() == 0 {
@@ -363,7 +367,6 @@ impl ServiceState {
             return self.finish_start(config, ip_pool, guard);
         }
 
-        let ip_pool = Arc::new(IpPool::new(&all_ips));
         self.finish_start(config, ip_pool, guard)
     }
 
@@ -393,7 +396,7 @@ impl ServiceState {
             .with_colo_filter(colo_filter.clone());
         // 客户端连接预算与测速/健康检查请求超时同源，rebuild_client 沿用同一值
         let client = Arc::new(build_hyper_client(lb_builder.timeout_ms()));
-        let lb = Arc::new(lb_builder.with_client(client.clone()).with_max_sticky_slots(config.max_sticky_slots));
+        let lb = Arc::new(lb_builder.with_client(client).with_max_sticky_slots(config.max_sticky_slots));
 
         crate::core::init_global_limiter(config.threads);
 
@@ -418,7 +421,6 @@ impl ServiceState {
                     timeout_ms: REQUEST_TIMEOUT_MS,
                     delay_limit,
                     colo_filter: colo_filter.map(Arc::new),
-                    client,
                 },
                 notify_rx,
                 cancel_token_for_httping,

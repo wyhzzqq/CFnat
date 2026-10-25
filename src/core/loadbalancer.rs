@@ -228,6 +228,10 @@ impl LoadBalancer {
         push_log("INFO", "[重建] HTTP 客户端已重建");
     }
 
+    pub(crate) fn current_client(&self) -> Option<Arc<crate::core::hyper::MyHyperClient>> {
+        self.client.read().clone()
+    }
+
     pub fn reset_all_metrics(&self) {
         let inner = self.inner.read();
         for backend in inner.primary.iter() {
@@ -658,7 +662,9 @@ impl LoadBalancer {
     pub fn start_health_check(self: Arc<Self>) -> Vec<JoinHandle<()>> {
         let mut handles = Vec::new();
 
-        let Some(client) = self.client.read().clone() else { return handles };
+        if self.client.read().is_none() {
+            return handles;
+        }
 
         handles.push(self.clone().start_sticky_maintainer());
 
@@ -672,7 +678,6 @@ impl LoadBalancer {
         let ping_config = PingConfig {
             tls_port: self.tls_port,
             http_port: self.http_port,
-            client,
             host: Arc::from(host.as_str()),
             scheme: Arc::from(scheme),
             path: Arc::from(path.as_str()),
@@ -742,7 +747,10 @@ impl LoadBalancer {
         pool_type: PoolType,
     ) {
         let is_primary = pool_type == PoolType::Primary;
-        
+
+        // 每轮从 client 字段取当前客户端，时间跳跃后的重建从本轮检查起生效
+        let Some(client) = self.current_client() else { return };
+
         let backends = {
             let mut inner = self.inner.write();
             let pool = if is_primary { &mut inner.primary } else { &mut inner.backup };
@@ -779,8 +787,9 @@ impl LoadBalancer {
                 }
 
                 let pc = ping_config.clone();
+                let client = client.clone();
                 join_set.spawn(async move {
-                    let result = crate::core::httping::http_ping_multi(backend.addr.ip(), &pc).await;
+                    let result = crate::core::httping::http_ping_multi(backend.addr.ip(), &client, &pc).await;
                     (backend, result)
                 });
 
